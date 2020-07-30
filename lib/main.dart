@@ -1,220 +1,250 @@
+import 'dart:core';
 import 'package:flutter/material.dart';
 import 'package:flutter/widgets.dart';
-import 'package:provider/provider.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
+import 'dart:io';
+import 'interface.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:math';
+import 'package:flutter/services.dart';
 
-void main() {
+Session get session => Session.current;
+List<Future<void> Function()> resumeActions = [];
+
+void main() async {
+  WidgetsFlutterBinding
+      .ensureInitialized(); // prevents weird race condition things?
+  await Session().loadPreferences();
   runApp(MyApp());
+
+  SystemChannels.lifecycle.setMessageHandler((msg) async {
+    if(msg==AppLifecycleState.resumed.toString()){
+      for(var action in resumeActions){
+        await action();
+      }
+      resumeActions.clear();
+    }
+    return null;
+  });
 }
 
-class MyApp extends StatelessWidget {
-  // This widget is the root of your application.
+class MyApp extends StatefulWidget {
+  @override
+  _MyAppState createState() => _MyAppState();
+}
+
+class _MyAppState extends State<MyApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // Try running your application with "flutter run". You'll see the
-        // application has a blue toolbar. Then, without quitting the app, try
-        // changing the primarySwatch below to Colors.green and then invoke
-        // "hot reload" (press "r" in the console where you ran "flutter run",
-        // or simply save your changes to "hot reload" in a Flutter IDE).
-        // Notice that the counter didn't reset back to zero; the application
-        // is not restarted.
-        primarySwatch: Colors.green,
-        // This makes the visual density adapt to the platform that you run
-        // the app on. For desktop platforms, the controls will be smaller and
-        // closer together (more dense) than on mobile platforms.
-        visualDensity: VisualDensity.adaptivePlatformDensity,
-      ),
-      home: ChangeNotifierProvider<API>(
-        create: (context) => API(),
-        child: DataViewPage(),
-      ),
-    );
+        title: 'Flutter Demo',
+        theme: ThemeData(
+          primarySwatch: Colors.green,
+          visualDensity: VisualDensity.adaptivePlatformDensity,
+        ),
+        routes: {
+          '/': (context) => LaunchPage(),
+          '/login': (context) => LoginPage(),
+          '/confirmlogin': (context) => ConfirmLoginPage(),
+          '/interface': (context) => InterfacePage(),
+        });
+  }
+
+  @override
+  dispose() {
+    session.close();
+    super.dispose();
   }
 }
 
-enum APIState { Inactive, Complete, Pending }
+enum LoginMethod { NotLoggedIn, Google }
 
-class API extends ChangeNotifier {
-  final String url = 'https://jec226.user.srcf.net/servertest/';
-  APIState state = APIState.Inactive;
+class Session {
+  static http.Client client = http.Client();
+  static Session current;
+  LoginMethod loginMethod;
+  SharedPreferences prefs;
+  String _deviceKey;
+  Map<String, String> profile;
 
-  String _query = "";
-  List<List<String>> result = [];
+  String get deviceKey => _deviceKey;
 
-  Future<void> queryOwner(String owner) async {
-    _query = owner;
-    await refreshResults();
+  Session() {
+    if (current != null)
+      throw Exception("Attempted to init session when one already existed");
+    current = this;
+    loginMethod = LoginMethod.NotLoggedIn;
   }
 
-  Future<void> insertRow(String owner, String content) async {
-    await refreshResults(
-        byaction: http
-            .post(url + "insert", body: {'owner': owner, 'content': content}));
+  Future<void> loadPreferences() async {
+    prefs = await SharedPreferences.getInstance();
+    if (prefs.containsKey('deviceKey')) {
+      _deviceKey = prefs.getString('deviceKey');
+    } else {
+      generateAndSaveDeviceKey();
+    }
   }
 
-  Future<void> deleteRow(String owner, String content) async {
-    await refreshResults(
-        byaction: http
-            .post(url + "delete", body: {'owner': owner, 'content': content}));
+  Future<bool> isAuthentic() async => (await get('auth/key')).body == 'valid';
+
+  Future<void> loadProfileData() async => profile =
+      Map<String, String>.from(jsonDecode((await get('profile')).body));
+
+  static const String _authority = 'jec226.user.srcf.net';
+  static const String _prepath = 'servertest';
+
+  Uri uri(String path, [Map<String, String> parameters]) {
+    var params = parameters ?? {};
+    if (deviceKey != null) params['device_key'] = deviceKey;
+    return Uri.https(_authority, '$_prepath/$path', params);
   }
 
-  Future<void> refreshResults(
-      {Future<void> byaction, bool notifyBeforeGetting = true}) async {
-    state = APIState.Pending;
-    if (notifyBeforeGetting) notifyListeners();
-    if (byaction != null) await byaction;
-    // getting the data
-    var address = url + (_query == "" ? "all" : ("owner/" + _query));
-    var text = (await http.get(address)).body;
-    result = jsonDecode(text)
-        .map<List<String>>(
-            (e) => e.map<String>((d) => d as String).toList() as List<String>)
-        .toList();
-    print(result);
-    // finish up
-    state = APIState.Complete;
-    notifyListeners();
+  Future<http.Response> post(String path, [Map<String, String> parameters]) {
+    return client.post(uri(path, parameters)).then((response) {
+      if (response.statusCode != HttpStatus.ok)
+        throw Exception('\'$path\' POST request with query \'$parameters\' '
+            'returned status ${response.statusCode} with body ${response.body}.');
+      return response;
+    });
   }
+
+  Future<http.Response> get(String path, [Map<String, String> parameters]) {
+    var u = uri(path, parameters);
+    print(u);
+    return client.get(u).then((response) {
+      if (response.statusCode != HttpStatus.ok)
+        throw Exception('\'$path\' GET request with query \'$parameters\' '
+            'returned status ${response.statusCode} with body ${response.body}.');
+      return response;
+    });
+  }
+
+  void generateAndSaveDeviceKey() {
+    var r = Random.secure();
+    var c = "qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM1234567890";
+    _deviceKey =
+        List<String>.generate(32, (i) => c[r.nextInt(c.length)]).join();
+    prefs.setString('deviceKey', _deviceKey);
+  }
+
+  void resetDeviceKey() => generateAndSaveDeviceKey();
+
+  void close() => client.close();
 }
 
-class DataViewPage extends StatelessWidget {
+class LaunchPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text("Test interface to SRCF database"),
-      ),
-      body: Column(
-        children: <Widget>[
-          IntrinsicHeight(
-              child: Padding(
-                  padding: EdgeInsets.all(5.0),
-                  child: TextField(
-                      onSubmitted: (String value) =>
-                          Provider.of<API>(context, listen: false)
-                              .queryOwner(value)))),
-          Expanded(child: DataViewTable()),
-        ],
-      ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: () => showDialog(
-          context: context,
-          builder: (__) {
-            return SimpleDialog(
-              title: const Text('Add new row'),
-              children: [
-                Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16.0),
-                    child: AddRowForm(api: Provider.of<API>(context))),
-              ],
-            );
-          },
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            RaisedButton(
+                child: Text('Proceed'),
+                onPressed: () async {
+                  tryAuthenticateWithDeviceKey(context);
+                }),
+            FlatButton(
+                child: Text('Reset device key'),
+                onPressed: () => session.resetDeviceKey())
+          ],
         ),
-        child: Icon(Icons.add),
       ),
     );
   }
+
+  Future<void> tryAuthenticateWithDeviceKey(BuildContext context) async {
+    if(await session.isAuthentic()){
+      await session.loadProfileData();
+      Navigator.of(context).pushReplacementNamed('/confirmlogin');
+    } else {
+      Navigator.of(context).pushReplacementNamed('/login');
+    }
+  }
 }
 
-class AddRowForm extends StatefulWidget {
-  final API api;
-
-  AddRowForm({Key key, this.api}) : super(key: key);
-
-  @override
-  _AddRowFormState createState() => _AddRowFormState();
-}
-
-// better way of doing this? possible to reduce AddRowForm to stateless?
-class _AddRowFormState extends State<AddRowForm> {
-  final formKey = GlobalKey<FormState>();
-  String owner;
-  String content;
-
+class LoginPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    return Form(
-      key: formKey,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: <Widget>[
-          TextFormField(
-            decoration: const InputDecoration(
-                icon: Icon(Icons.person), labelText: 'Owner'),
-            validator: (value) => value.length <= 10 && value.isNotEmpty
-                ? null
-                : "Owner must be between 1–10 characters.",
-            onSaved: (String value) => owner = value,
-          ),
-          TextFormField(
-            decoration: const InputDecoration(labelText: 'Content'),
-            validator: (value) =>
-                value.isNotEmpty ? null : "Content cannot be empty.",
-            onSaved: (String value) => content = value,
-          ),
-          Padding(
-            padding: const EdgeInsets.only(top: 16.0),
-            child: RaisedButton(
-              onPressed: () {
-                if (formKey.currentState.validate()) {
-                  formKey.currentState.save();
-                  widget.api.insertRow(owner, content);
-                  Navigator.pop(context);
-                }
-              },
-              child: Text('Submit'),
+    return Scaffold(
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            RaisedButton(
+              child: Text('Log in with Google'),
+              onPressed: () => tryAuthGoogle(context),
             ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> tryAuthGoogle(BuildContext context) async {
+    if (session.loginMethod != LoginMethod.NotLoggedIn) return;
+    session.loginMethod = LoginMethod.Google;
+    var authUrl = (await session.get('auth/google/authreq')).body;
+    webAuthByUrl(context, authUrl);
+    // The query below is held by the server until authorization completes
+    var authCompleteQuery = await session.get('auth/wait');
+    resumeActions.add(() async {
+      if (authCompleteQuery.statusCode == HttpStatus.ok) {
+        assert(await session.isAuthentic());
+        await session.loadProfileData();
+        Navigator.popAndPushNamed(context, '/confirmlogin');
+      } else {
+        session.loginMethod = LoginMethod.NotLoggedIn;
+        authenticationFailed(context);
+      }
+    });
+  }
+
+  void webAuthByUrl(BuildContext context, String authUrl) {
+    launch(authUrl, enableJavaScript: true);
+  }
+
+  void authenticationFailed(BuildContext context) {
+    showDialog(
+        context: context,
+        builder: (context) => SimpleDialog(
+              title: const Text('Authentication failed'),
+              children: [SimpleDialogOption(child: Text('Ok'))],
+            ));
+  }
+}
+
+class ConfirmLoginPage extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Authentication successful')),
+      body: Column(
+        children: [
+          Expanded(
+              child: Table(
+                  children: session.profile.entries
+                      .map((entry) => TableRow(
+                          children: [Text(entry.key), Text(entry.value)]))
+                      .toList())),
+          RaisedButton(
+            child: Text('Ok'),
+            onPressed: () {
+              Navigator.of(context).pushReplacementNamed("/interface");
+            },
+          ),
+          FlatButton(
+            child: Text('Cancel'),
+            onPressed: () {
+              session.loginMethod = LoginMethod.NotLoggedIn;
+              Navigator.of(context).pushReplacementNamed('/login');
+            },
           ),
         ],
       ),
     );
-  }
-}
-
-class DataViewTable extends StatefulWidget {
-  @override
-  _DataViewTableState createState() => _DataViewTableState();
-}
-
-class _DataViewTableState extends State<DataViewTable> {
-  final GlobalKey<RefreshIndicatorState> refreshKey =
-      GlobalKey<RefreshIndicatorState>();
-
-  @override
-  Widget build(BuildContext context) {
-    var api = Provider.of<API>(context);
-    var refresh = RefreshIndicator(
-        key: refreshKey,
-        onRefresh: () => api.refreshResults(notifyBeforeGetting: false),
-        child: ListView(
-            physics: const AlwaysScrollableScrollPhysics(),
-            children: api.result
-                .map<Widget>(
-                  (row) => Padding(
-                    padding: EdgeInsets.all(5.0),
-                    child: Dismissible(
-                      key: ObjectKey(row),
-                      direction: DismissDirection.startToEnd,
-                      child: Row(children: [
-                        Text(row[0]),
-                        Expanded(child: Text("")),
-                        Text(row[1])
-                      ]),
-                      onDismissed: (dir) {
-                        api.result.remove(row);
-                        api.deleteRow(row[0], row[1]);
-                      },
-                    ),
-                  ),
-                )
-                .toList()));
-    if (api.state == APIState.Pending) refreshKey.currentState.show();
-    return refresh;
   }
 }
